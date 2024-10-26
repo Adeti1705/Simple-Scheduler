@@ -238,9 +238,6 @@ int launch(char **command_line, bool background)
             print_history();
             exit(0);
         }
-        // execvp(command_line[0], command_line);
-        // printf("Command not found: %s\n", command_line[0]);
-        // exit(1);
         if (strcmp(command_line[0], "submit") == 0)
         {
             if (sem_wait(&p_table->mutex) == -1)
@@ -281,9 +278,9 @@ int launch(char **command_line, bool background)
             return 0;
         }
 
-        // int status;
-        // status = create_process_and_run(command);
-        // return status;
+        int status;
+        status = shell_proc(command_line);
+        return status;
     }
     else
     {
@@ -300,7 +297,84 @@ int launch(char **command_line, bool background)
     }
     return pid;
 }
+int shell_proc(char **cmd)
+{
+    bool background = false;
+    size_t len = strlen(cmd);
+    if (len > 0 && cmd[len - 2] == '&')
+    {
+        background = true;
+        cmd[len - 2] = '\0';
+    }
+    char *cmd_copy = strdup(cmd);
+    int pid=-1;
+    if (hasPipes(cmd))
+    {
+        char **command_1 = break_delim(cmd, "|");
+        char ***command_2 = pipe_manager(command_1);
+        pid = pipe_execute(command_2); // pipe execution not yet supporting background
+    }
+    else
+    {
+        char **command = break_delim(cmd, " \n");
+        pid = launch2(command, background); // pass the background flag
+    }
 
+    // only add to history for foreground processes
+    if (!background)
+    {
+        add_to_history(cmd_copy, pid, start_time, current_time());
+    }
+    return pid;
+}
+int launch2(char **command_line, bool background)
+{
+    int pid = fork();
+    if (pid < 0)
+    {
+        printf("Fork failed.\n");
+        return -1;
+    }
+    else if (pid == 0)
+    {
+        if (strcmp(command_line[0], "history") == 0)
+        {
+            print_history();
+            exit(0);
+        }
+        execvp(command_line[0], command_line);
+        printf("Command not found: %s\n", command_line[0]);
+        exit(1);
+    }
+    else
+    {
+        // Updating global array with pid in process table (for non-piped processes)
+        if (sem_wait(&p_table->mutex) == -1)
+        {
+            perror("sem_wait");
+            exit(1);
+        }
+        p_table->history[p_table->history_count].pid = pid;
+        p_table->history[p_table->history_count].completed = false; // Setting process as incomplete initially
+        if (sem_post(&p_table->mutex) == -1)
+        {
+            perror("sem_post");
+            exit(1);
+        }
+
+        if (!background)
+        {
+            // Parent waits for non-& commands
+            int status;
+            waitpid(pid, &status, 0);
+        }
+        else
+        {
+            printf("Started background process with PID: %d\n", pid);
+        }
+    }
+    return pid;
+}
 // executes commands with pipes
 int pipe_execute(char ***commands)
 {
@@ -325,7 +399,7 @@ int pipe_execute(char ***commands)
         }
         else if (pid == 0)
         {
-            // child process
+            // Child process
             if (inputfd != STDIN_FILENO)
             {
                 dup2(inputfd, STDIN_FILENO);
@@ -343,12 +417,26 @@ int pipe_execute(char ***commands)
         }
         else
         {
+            // Update process table with pid for the current piped command
+            if (sem_wait(&p_table->mutex) == -1)
+            {
+                perror("sem_wait");
+                exit(1);
+            }
+            p_table->history[p_table->history_count].pid = pid;
+            p_table->history[p_table->history_count].completed = false;
+            if (sem_post(&p_table->mutex) == -1)
+            {
+                perror("sem_post");
+                exit(1);
+            }
+
             close(pipefd[1]);
             if (inputfd != STDIN_FILENO)
             {
                 close(inputfd);
             }
-            inputfd = pipefd[0]; // uses pipe read end as input for next command
+            inputfd = pipefd[0];
             lastChildPID = pid;
             i++;
         }
@@ -539,38 +627,8 @@ int main(int argc, char **argv)
         }
 
         update_ptable(p_table);
-
-        long start_time = current_time();
-        int pid;
         bool background = false;
-
-        // checks if command ends with '&'
-        size_t len = strlen(cmd);
-        if (len > 0 && cmd[len - 2] == '&')
-        {
-            background = true;
-            cmd[len - 2] = '\0';
-        }
-        char *cmd_copy = strdup(cmd);
-
-        if (hasPipes(cmd))
-        {
-            char **command_1 = break_delim(cmd, "|");
-            char ***command_2 = pipe_manager(command_1);
-            pid = pipe_execute(command_2); // pipe execution not yet supporting background
-        }
-        else
-        {
-            char **command = break_delim(cmd, " \n");
-            pid = launch(command, background); // pass the background flag
-        }
-
-        // only add to history for foreground processes
-        if (!background)
-        {
-            add_to_history(cmd_copy, pid, start_time, current_time());
-        }
-
+        launch(cmd, background);
         free(cmd);
     }
     return 0;
