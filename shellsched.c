@@ -11,15 +11,19 @@
 #include <semaphore.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <errno.h>
+
 
 struct Process {
     int pid, priority;
     bool submit, queue, completed;
     char command[100];
     struct timeval start;
+    int time_slice_count;
+    bool in_queue; 
     unsigned long execution_time, wait_time, vruntime;
+    int arrival_time;
 };
-
 struct history_struct {
     int history_count, ncpu, tslice;
     sem_t mutex;
@@ -33,14 +37,14 @@ void start_time(struct timeval *start) {
     gettimeofday(start, 0);
 }
 
-unsigned long end_time(struct timeval *start) {
-    struct timeval end;
-    unsigned long t;
+// unsigned long end_time(struct timeval *start) {
+//     struct timeval end;
+//     unsigned long t;
 
-    gettimeofday(&end, 0);
-    t = ((end.tv_sec * 1000000) + end.tv_usec) - ((start->tv_sec * 1000000) + start->tv_usec);
-    return t / 1000;
-}
+//     gettimeofday(&end, 0);
+//     t = ((end.tv_sec * 1000000) + end.tv_usec) - ((start->tv_sec * 1000000) + start->tv_usec);
+//     return t / 1000;
+// }
 
 void print_history() {
     printf("\nCommand History:\n");
@@ -54,39 +58,9 @@ void print_history() {
 }
 
 void my_handler(int signum, siginfo_t *info, void *ptr) {
-    static bool terminating = false; // Prevent multiple terminations
-    if (terminating) return;
-    terminating = true;
-
-    printf("Caught signal: %d\n", signum); // Debug print
     if (signum == SIGINT) {
-        printf("Terminating scheduler and shell\n");
-        if (kill(sch_pid, SIGINT) == -1) {
-            printf("Error terminating scheduler\n");
-            exit(1);
-        }
-
-        sem_wait(&p_table->mutex);
         print_history();
-        sem_post(&p_table->mutex);
-
-        if (sem_destroy(&p_table->mutex) == -1) {
-            printf("Error destroying semaphore\n");
-            exit(1);
-        }
-        if (munmap(p_table, sizeof(struct history_struct)) < 0) {
-            printf("Error unmapping shared memory\n");
-            exit(1);
-        }
-        if (close(shm_fd) == -1) {
-            printf("Error closing shared memory\n");
-            exit(1);
-        }
-        if (shm_unlink("shm") == -1) {
-            printf("Error unlinking shared memory\n");
-            exit(1);
-        }
-        exit(0); // Ensure the program exits
+        exit(0);
     } else if (signum == SIGCHLD) {
         pid_t cur_pid = info->si_pid;
         if (sch_pid == cur_pid) {
@@ -94,8 +68,11 @@ void my_handler(int signum, siginfo_t *info, void *ptr) {
         }
         sem_wait(&p_table->mutex);
         for (int i = 0; i < p_table->history_count; i++) {
-            if (p_table->history[i].pid == cur_pid) {
-                p_table->history[i].execution_time += end_time(&p_table->history[i].start);
+            if (p_table->history[i].pid == cur_pid && !p_table->history[i].completed) {
+                // struct timeval end;
+                // gettimeofday(&end, NULL);
+                p_table->history[i].execution_time = p_table->history[i].time_slice_count * p_table->tslice;
+               // p_table->history[i].execution_time = (end.tv_sec - p_table->history[i].start.tv_sec) * 1000 +(end.tv_usec - p_table->history[i].start.tv_usec) / 1000;
                 p_table->history[i].completed = true;
                 break;
             }
@@ -105,28 +82,20 @@ void my_handler(int signum, siginfo_t *info, void *ptr) {
 }
 
 void sig_handler() {
-    struct sigaction sig;
-    memset(&sig, 0, sizeof(sig));
-    sig.sa_sigaction = my_handler;
-    sig.sa_flags = SA_SIGINFO | SA_NOCLDSTOP | SA_RESTART;
-    if (sigaction(SIGINT, &sig, NULL) != 0) {
-        printf("Signal handling failed.\n");
-        exit(1);
-    }
-    if (sigaction(SIGCHLD, &sig, NULL) != 0) {
-        printf("Signal handling failed.\n");
-        exit(1);
-    }
-}
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = my_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
 
-long current_time() {
-    struct timeval t;
-    if (gettimeofday(&t, NULL) != 0) {
-        perror("Error in getting the time");
+    if (sigaction(SIGINT, &sa, NULL) == -1) {
+        perror("Error setting up SIGINT handler");
         exit(1);
     }
-    long epoch_microsec = t.tv_sec * 1000000;
-    return epoch_microsec + t.tv_usec;
+
+    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
+        perror("Error setting up SIGCHLD handler");
+        exit(1);
+    }
 }
 
 int pipe_execute(char ***commands) {
@@ -146,6 +115,7 @@ int pipe_execute(char ***commands) {
             perror("Fork failed");
             exit(EXIT_FAILURE);
         } else if (pid == 0) {
+            signal(SIGINT, SIG_DFL);  // Reset SIGINT handler to default in child
             if (inputfd != STDIN_FILENO) {
                 dup2(inputfd, STDIN_FILENO);
                 close(inputfd);
@@ -159,17 +129,6 @@ int pipe_execute(char ***commands) {
             perror("execvp failed");
             exit(EXIT_FAILURE);
         } else {
-            if (sem_wait(&p_table->mutex) == -1) {
-                perror("sem_wait");
-                exit(1);
-            }
-            p_table->history[p_table->history_count].pid = pid;
-            p_table->history[p_table->history_count].completed = false;
-            if (sem_post(&p_table->mutex) == -1) {
-                perror("sem_post");
-                exit(1);
-            }
-
             close(pipefd[1]);
             if (inputfd != STDIN_FILENO) {
                 close(inputfd);
@@ -192,6 +151,7 @@ int launch2(char **command_line, bool background) {
         printf("Fork failed.\n");
         return -1;
     } else if (pid == 0) {
+        signal(SIGINT, SIG_DFL);  // Reset SIGINT handler to default in child
         if (strcmp(command_line[0], "history") == 0) {
             print_history();
             exit(0);
@@ -200,17 +160,6 @@ int launch2(char **command_line, bool background) {
         printf("Command not found: %s\n", command_line[0]);
         exit(1);
     } else {
-        if (sem_wait(&p_table->mutex) == -1) {
-            perror("sem_wait");
-            exit(1);
-        }
-        p_table->history[p_table->history_count].pid = pid;
-        p_table->history[p_table->history_count].completed = false;
-        if (sem_post(&p_table->mutex) == -1) {
-            perror("sem_post");
-            exit(1);
-        }
-
         if (!background) {
             int status;
             waitpid(pid, &status, 0);
@@ -253,39 +202,67 @@ char ***pipe_manager(char **cmds) {
     commands[j] = NULL;
     return commands;
 }
-
 int submit_process(char *command, char *priority) {
     int priority_int = atoi(priority);
     if (priority_int < 1 || priority_int > 4) {
-        printf("invalid input for submit command");
-        p_table->history[p_table->history_count].completed = true;
+        printf("Invalid input for submit command\n");
         return -1;
     }
-    p_table->history[p_table->history_count].priority = priority_int;
 
-    char *exec_command[2] = {command, NULL};
+    // Create a new Process structure
+    struct Process new_process;
+    strcpy(new_process.command, command);
+    new_process.priority = priority_int;
+    // new_process.pid = -1;  // Will be set when actually executed
+    // new_process.submit = true;
+    // new_process.completed = false;
+    // new_process.queue = false;
+    // new_process.execution_time = 0;
+    // new_process.wait_time = 0;
+    // new_process.arrival_time = time(NULL);  // Current time
 
-    int status;
-    status = fork();
-    if (status < 0) {
-        printf("fork() failed.\n");
+     new_process.pid = fork();
+    if (new_process.pid == 0) {
+        // Child process
+        char *args[] = {command, NULL};
+        execvp(command, args);
+        perror("execvp");
         exit(1);
-    } else if (status == 0) {
-        if (execvp(exec_command[0], exec_command) == -1) {
-            perror("execvp");
-            printf("Not a valid/supported command.\n");
-            exit(1);
+    } else if (new_process.pid > 0) {
+        // Parent process
+        new_process.submit = true;
+        new_process.completed = false;
+        new_process.queue = false;
+        new_process.in_queue = false;
+        new_process.execution_time = 0;
+        new_process.wait_time = 0;
+        new_process.arrival_time = time(NULL);
+
+        if (sem_wait(&p_table->mutex) == -1) {
+            perror("sem_wait");
+            return -1;
         }
-        exit(0);
+
+        if (p_table->history_count < 100) {
+            p_table->history[p_table->history_count] = new_process;
+            p_table->history_count++;
+            printf("Process submitted successfully. PID: %d\n", new_process.pid);
+        } else {
+            printf("Process queue is full. Cannot submit more processes.\n");
+            kill(new_process.pid, SIGKILL);
+        }
+
+        if (sem_post(&p_table->mutex) == -1) {
+            perror("sem_post");
+            return -1;
+        }
+
+        return new_process.pid;
     } else {
-        if (kill(status, SIGSTOP) == -1) {
-            perror("kill");
-            exit(1);
-        }
-        return status;
+        perror("fork");
+        return -1;
     }
 }
-
 bool hasPipes(char *str) {
     for (int i = 0; str[i] != '\0'; i++) {
         if (str[i] == '|') {
@@ -302,7 +279,7 @@ int shell_proc(char *cmd) {
         background = true;
         cmd[len - 2] = '\0';
     }
-    char *cmd_copy = strdup(cmd);
+    
     int pid = -1;
     if (hasPipes(cmd)) {
         char **command_1 = break_delim(cmd, "|");
@@ -313,21 +290,30 @@ int shell_proc(char *cmd) {
         pid = launch2(command, background);
     }
 
+    return pid;
+}
+
+void add_to_history(char *cmd, int pid) {
     if (sem_wait(&p_table->mutex) == -1) {
         perror("sem_wait");
         exit(1);
     }
-    strcpy(p_table->history[p_table->history_count].command, cmd_copy);
-    p_table->history[p_table->history_count].pid = pid;
-    p_table->history[p_table->history_count].completed = false;
-    p_table->history_count++;
+    printf("Adding process %s ", cmd);
+    int index = p_table->history_count;
+    strcpy(p_table->history[index].command, cmd);
+    p_table->history[index].pid = pid;
+    p_table->history[index].completed = false;
+    p_table->history[index].submit = strncmp(cmd, "submit", 6) == 0;
+    // p_table->history[index].execution_time = 0;
+    // p_table->history[index].wait_time = 0;
+    p_table->history[index].time_slice_count = 0;
+    p_table->history[index].in_queue = false;
+    gettimeofday(&p_table->history[index].start, NULL);
     if (sem_post(&p_table->mutex) == -1) {
         perror("sem_post");
         exit(1);
     }
 
-    free(cmd_copy);
-    return pid;
 }
 
 int launch(char *command_line, bool background) {
@@ -336,64 +322,57 @@ int launch(char *command_line, bool background) {
         printf("Fork failed.\n");
         return -1;
     } else if (pid == 0) {
+        //signal(SIGINT, SIG_DFL);  // Reset SIGINT handler to default in child
         if (strncmp(command_line, "history", 7) == 0) {
             print_history();
-            exit(0);
+            exit(0);                       //terminates child               
         }
         if (strncmp(command_line, "submit", 6) == 0) {
-            if (sem_wait(&p_table->mutex) == -1) {
-                perror("sem_wait");
-                exit(1);
-            }
-            p_table->history[p_table->history_count].submit = true;
-            p_table->history[p_table->history_count].completed = false;
-            p_table->history[p_table->history_count].priority = 1;
-            p_table->history[p_table->history_count].queue = false;
-            start_time(&p_table->history[p_table->history_count].start);
             char **command = break_delim(command_line, " ");
             int command_count = 0;
             while (command[command_count] != NULL) {
                 command_count++;
             }
 
+            int submit_pid;
             if (command_count == 3) {
-                p_table->history[p_table->history_count].pid = submit_process(command[1], command[2]);
+                submit_pid = submit_process(command[1], command[2]);
             } else {
-                p_table->history[p_table->history_count].pid = submit_process(command[1], "1");
+                submit_pid = submit_process(command[1], "1");
             }
-
-            start_time(&p_table->history[p_table->history_count].start);
-            if (sem_post(&p_table->mutex) == -1) {
-                perror("sem_post");
-                exit(1);
-            }
-            return 1;
-        }
-        if (strncmp(command_line, "exit", 4) == 0) {
-            return 0;
+            exit(submit_pid);
         }
 
         int status;
         status = shell_proc(command_line);
-        return status;
+        exit(status);
     } else {
+        //add_to_history(command_line, pid);  // Add all commands to history
+
         if (!background) {
-            int status;
-            waitpid(pid, &status, 0);
+            int st;
+            waitpid(pid, &st, 0);
         } else {
             printf("Started background process with PID: %d\n", pid);
         }
     }
+    printf("returing from launch\n");
     return pid;
 }
 
 struct history_struct *setup() {
-    shm_unlink("shm");
-
     shm_fd = shm_open("shm", O_CREAT | O_RDWR, 0666);
     if (shm_fd == -1) {
-        perror("shm_open");
-        exit(1);
+        if (errno == EEXIST) {
+            shm_fd = shm_open("shm", O_RDWR, 0666);
+            if (shm_fd == -1) {
+                perror("shm_open");
+                exit(1);
+            }
+        } else {
+            perror("shm_open");
+            exit(1);
+        }
     }
 
     if (ftruncate(shm_fd, sizeof(struct history_struct)) == -1) {
@@ -419,13 +398,14 @@ void update_ptable(struct history_struct *p_table) {
         perror("sem_wait");
         exit(1);
     }
-
+    p_table->history[p_table->history_count].time_slice_count = 0;
     p_table->history[p_table->history_count].pid = -1;
     p_table->history[p_table->history_count].submit = false;
     p_table->history[p_table->history_count].wait_time = 0;
     p_table->history[p_table->history_count].execution_time = 0;
     p_table->history[p_table->history_count].vruntime = 0;
     start_time(&p_table->history[p_table->history_count].start);
+    //p_table->history_count++;
 
     if (sem_post(&p_table->mutex) == -1) {
         perror("sem_post");
@@ -434,7 +414,6 @@ void update_ptable(struct history_struct *p_table) {
 }
 
 int main(int argc, char **argv) {
-    sig_handler();
     if (argc != 3) {
         printf("invalid input parameters");
         exit(1);
@@ -453,15 +432,19 @@ int main(int argc, char **argv) {
         exit(1);
     }
     p_table->tslice = atoi(argv[2]);
+    
+    sig_handler();  // Set up signal handlers
+
     printf("Forking child proc for scheduler\n");
     int stat = fork();
     if (stat < 0) {
-        printf("Forking failed");
+        perror("Forking failed");
         exit(1);
     }
     if (stat == 0) {
-        execlp("./scheduler", "./scheduler", NULL);
-        printf("execvp failed");
+        char *scheduler_args[] = {"./scheduler", NULL};
+        execv("./scheduler", scheduler_args);
+        perror("execv failed");
         exit(1);
     } else {
         sch_pid = stat;
@@ -474,28 +457,69 @@ int main(int argc, char **argv) {
         getcwd(current_dir, sizeof(current_dir));
         printf(">%s>>> ", current_dir);
         cmd = (char *)malloc(100);
-        fgets(cmd, 100, stdin);
+        if (cmd == NULL) {
+            perror("Memory allocation failed");
+            exit(1);
+        }
+
+        if (fgets(cmd, 100, stdin) == NULL) {
+            if (feof(stdin)) {
+                printf("\nEnd of input. Exiting...\n");
+                free(cmd);
+                break;
+            } else {
+                perror("Error reading input");
+                free(cmd);
+                continue;
+            }
+        }
 
         if (strlen(cmd) > 0 && cmd[strlen(cmd) - 1] == '\n') {
             cmd[strlen(cmd) - 1] = '\0';
         }
 
-        if (sem_wait(&p_table->mutex) == -1) {
-            perror("sem_wait");
-            exit(1);
+        if (strlen(cmd) == 0) {
+            free(cmd);
+            continue;
         }
 
-        strcpy(p_table->history[p_table->history_count].command, cmd);
-
-        if (sem_post(&p_table->mutex) == -1) {
-            perror("sem_post");
-            exit(1);
+        if (strcmp(cmd, "exit") == 0) {
+            free(cmd);
+            break;
         }
 
         update_ptable(p_table);
         bool background = false;
-        launch(cmd, background);
+        //launch(cmd, background);
+        int pid = launch(cmd, background);
+        add_to_history(cmd, pid);
         free(cmd);
     }
+
+    // Cleanup code
+    if (kill(sch_pid, SIGINT) == -1) {
+        perror("Error terminating scheduler");
+    }
+
+    sem_wait(&p_table->mutex);
+    print_history();
+    sem_post(&p_table->mutex);
+
+    if (sem_destroy(&p_table->mutex) == -1) {
+        perror("Error destroying semaphore");
+    }
+    if (munmap(p_table, sizeof(struct history_struct)) < 0) {
+        perror("Error unmapping shared memory");
+    }
+    if (close(shm_fd) == -1) {
+        perror("Error closing shared memory");
+    }
+    if (shm_unlink("shm") == -1) {
+        if (errno != ENOENT) {
+            perror("Error unlinking shared memory");
+        }
+    }
+
     return 0;
 }
+// the cmds are adding to history but not printing??
