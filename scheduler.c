@@ -10,122 +10,108 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <semaphore.h>
-#include <errno.h>
 
-#define MAX_SUBMIT 25
-
+//struct definitions
 struct Process
 {
     int pid, priority;
-    bool submit, completed;
+    bool submit, in_queue, completed;
     char command[100];
     struct timeval start;
-    int time_slice_count;
-    bool in_queue;
-    unsigned long execution_time, wait_time;
-    // int arrival_time;
+    unsigned long exe_time, wait_time;
 };
 
-struct history_struct
+struct hist
 {
-    int history_count, ncpu, tslice;
+    int history_count, ncpu, time_slice;
     sem_t mutex;
     struct Process history[100];
 };
 
-struct Queue
+struct queue
 {
-    // no curr
-    int front, rear, size, capacity;
-    struct Process **items1;
+    int head, tail, capacity, curr;
+    struct Process **items;
 };
 
-struct PriorityQueue
+struct pqueue
 {
     int size, capacity;
-    struct Process **items2;
+    struct Process **min_heap;
 };
 
 int shm_fd;
-// volatile sig_atomic_t terminate_flag = 0;
-bool terminate_flag = false;
-struct history_struct *p_table;
-struct Queue *running_queue;
-struct PriorityQueue *ready_queue;
-// int total_elapsed_time = 0;
+bool ending = false;
+struct hist *p_table;
+struct queue *running;
+struct pqueue *waiting;
 
-bool is_queue_empty(struct Queue *q)
+// check if queue is empty
+bool is_qempty(struct queue *q)
 {
-    return q->front == q->rear;
+    return q->head == q->tail;
 }
-int next_head(struct Queue *q)
+
+// check if queue is full
+bool q_full(struct queue *q)
 {
-    if (q->front == q->capacity - 1)
+    return (q->tail + 1) % q->capacity == q->head;;
+}
+
+// add a process to the running queue
+void running_enqueue(struct queue *q, struct Process *proc)
+{
+    if (q_full(q))
     {
-        return 0;
+        printf("rqueue overflow\n");
+        return;
     }
-    return q->front + 1;
+    q->items[q->tail] = proc;
+    q->tail = (q->tail + 1) % q->capacity; 
+    q->curr++;
 }
-int next_tail(struct Queue *q)
+
+// remove a process from the running queue
+void running_dequeue(struct queue *q)
 {
-    if (q->rear == q->capacity - 1)
+    if (is_qempty(q))
     {
-        return 0;
+        printf("rqueue underflow\n");
+        return;
     }
-    return q->rear + 1;
+    q->head = (q->head + 1) % q->capacity;
+    q->curr--;
 }
 
-bool is_queue_full(struct Queue *q)
-{
-    return next_tail(q) == q->front;
-}
-
-void enqueue(struct Queue *q, struct Process *proc)
-{
-    if (is_queue_full(q))
-        return;
-    q->size++;
-    q->items1[q->rear] = proc;
-    q->rear = next_tail(q);
-}
-
-void dequeue(struct Queue *q)
-{
-    if (is_queue_empty(q))
-        return;
-
-    // struct Process *proc = q->items1[q->front];
-    q->front = next_head(q);
-    q->size--;
-    return;
-}
-
-// Priority Queue operations
-bool is_pqueue_empty(struct PriorityQueue *pq)
+// pqueue methods
+// check if priority queue is empty
+bool is_pqempty(struct pqueue *pq)
 {
     return pq->size == 0;
 }
 
-bool is_pqueue_full(struct PriorityQueue *pq)
+// check if priority queue is full
+bool pqueue_full(struct pqueue *pq)
 {
     return pq->size == pq->capacity;
 }
 
-void swap_processes(struct Process **a, struct Process **b)
+void swap_p(struct Process *a, struct Process *b)
 {
-    struct Process *temp = *a;
+    struct Process temp = *a;
     *a = *b;
     *b = temp;
 }
 
-void heapify_up(struct PriorityQueue *pq, int index)
+// move a process up the heap to maintain heap property
+void heapifyup(struct pqueue *pq, int index)
 {
     while (index > 0)
     {
         int parent = (index - 1) / 2;
-        if (pq->items2[index]->priority < pq->items2[parent]->priority)
+        if (pq->min_heap[index]->priority < pq->min_heap[parent]->priority)
         {
-            swap_processes(&pq->items2[index], &pq->items2[parent]);
+            swap_p(pq->min_heap[index], pq->min_heap[parent]);
             index = parent;
         }
         else
@@ -134,130 +120,130 @@ void heapify_up(struct PriorityQueue *pq, int index)
         }
     }
 }
-//heap on the basis of execution time changing to vruntime
-void heapify_down(struct PriorityQueue *pq, int index)
+
+// move a process down the heap to maintain heap property
+void heapifydown(struct pqueue *pq, int index)
 {
-    int min_index = index;
-    int left_child = 2 * index + 1;
-    int right_child = 2 * index + 2;
+    int leftChild = 2 * index + 1;
+    int rightChild = 2 * index + 2;
+    int smallest = index;
 
-    if (left_child < pq->size && pq->items2[left_child]->priority < pq->items2[min_index]->priority)
+    if (leftChild < pq->size && pq->min_heap[leftChild]->priority < pq->min_heap[smallest]->priority)
     {
-        min_index = left_child;
+        smallest = leftChild;
     }
 
-    if (right_child < pq->size && pq->items2[right_child]->priority < pq->items2[min_index]->priority)
+    if (rightChild < pq->size && pq->min_heap[rightChild]->priority < pq->min_heap[smallest]->priority)
     {
-        min_index = right_child;
+        smallest = rightChild;
     }
 
-    if (min_index != index)
+    if (smallest != index)
     {
-        swap_processes(&pq->items2[index], &pq->items2[min_index]);
-        heapify_down(pq, min_index);
+        swap_p(pq->min_heap[index], pq->min_heap[smallest]);
+        heapifydown(pq, smallest);
     }
 }
 
-void pq_insert(struct PriorityQueue *pq, struct Process *proc)
+// add a process to the waiting queue
+void waiting_enqueue(struct pqueue *pq, struct Process *proc)
 {
-    if (is_pqueue_full(pq))
-        return;
-    pq->items2[pq->size] = proc;
-    heapify_up(pq, pq->size);
-    pq->size++;
+    if (pq->size < pq->capacity)
+    {
+        pq->min_heap[pq->size] = proc;
+        heapifyup(pq, pq->size);
+        pq->size++;
+    }
 }
 
-struct Process *pq_extract_min(struct PriorityQueue *pq)
+// remove the process with highest priority from waiting queue
+struct Process *extract_min(struct pqueue *pq)
 {
-    if (is_pqueue_empty(pq))
-        return NULL;
-    struct Process *min_proc = pq->items2[0];
-    pq->items2[0] = pq->items2[pq->size - 1];
-    pq->size--;
-    heapify_down(pq, 0);
-    return min_proc;
+    if (pq->size > 0)
+    {
+        struct Process *removed = pq->min_heap[0];
+        pq->min_heap[0] = pq->min_heap[pq->size - 1];
+        pq->size--;
+        heapifydown(pq, 0);
+        return removed;
+    }
+    return NULL;
 }
+
+// to record start time
 void start_time(struct timeval *start)
 {
     gettimeofday(start, 0);
 }
 
-// function to get time duration since start time
+// function to calculate elapsed time
 unsigned long end_time(struct timeval *start)
 {
     struct timeval end;
     unsigned long t;
 
     gettimeofday(&end, 0);
-    t = ((end.tv_sec * 1000) + end.tv_usec/1000) - ((start->tv_sec/1000) + start->tv_usec/1000);
+    t = ((end.tv_sec / 1000) + end.tv_usec*1000) - ((start->tv_sec / 1000) + start->tv_usec*1000);
     return t;
 }
 
-
-void cleanup_and_exit()
+//to terminate schduler
+void terminate()
 {
-    printf("\nTerminating scheduler...\n");
-
-    free(running_queue->items1);
-    free(running_queue);
-    free(ready_queue->items2);
-    free(ready_queue);
-
+    printf("terminating scheduler\n");
+    // cleanups for malloc
+    free(running->items);
+    free(running);
+    free(waiting->min_heap);
+    free(waiting);
+    // destroying the semaphore
     if (sem_destroy(&p_table->mutex) == -1)
     {
-        perror("sem_destroy");
+        perror("shm_destroy");
+        exit(1);
     }
-    if (munmap(p_table, sizeof(struct history_struct)) < 0)
+    // unmapping shared memory segment followed by a "close" call
+    if (munmap(p_table, sizeof(struct hist)) < 0)
     {
+        printf("Error unmapping\n");
         perror("munmap");
+        exit(1);
     }
-
     if (close(shm_fd) == -1)
     {
         perror("close");
+        exit(1);
     }
-    if (shm_unlink("shm") == -1)
-    {
-        perror("shm_unlink");
-    }
-
     exit(0);
 }
-void schedule_processes(int cpu_count, int time_slice)
+
+//main scheduler code- chks the queues and schedules the processes
+void scheduler(int ncpu, int time_slice)
 {
-    unsigned long total_elapsed_time = 0;
-    while (1)
+    while (true)
     {
-        sleep(time_slice/1000);
-        //printf("hi after sleep\n");
-        total_elapsed_time += time_slice;
+       sleep(time_slice / 1000);
+       //usleep(time_slice * 1000); 
         if (sem_wait(&p_table->mutex) == -1)
         {
-            perror("sem_wait4");
+            perror("sem_wait");
             exit(1);
         }
-        
-        if (terminate_flag && is_queue_empty(running_queue) && is_pqueue_empty(ready_queue))
+        // this if-block - scheduler terminates after natural endingination of all processes
+        if (ending && is_qempty(running) && is_pqempty(waiting))
         {
-            printf("nigeerrrrrrrrrrffffffffff...\n");
-            cleanup_and_exit();
-            sem_post(&p_table->mutex);
-            break;
+            terminate();
         }
 
-        // Check for new processes and add them to ready queue
+        // adding process to ready queue if they have submit true
         for (int i = 0; i < p_table->history_count; i++)
         {
             if (p_table->history[i].submit && !p_table->history[i].completed && !p_table->history[i].in_queue)
-
             {
-                //printf("Scheduler found new process: %s, PID: %d\n", p_table->history[i].command, p_table->history[i].pid);
-                if (ready_queue->size + cpu_count < ready_queue->capacity - 1)
+                if (waiting->size + ncpu < waiting->capacity - 1)
                 {
                     p_table->history[i].in_queue = true;
-                    // p_table->history[i].arrival_time = total_elapsed_time;
-                    printf("Adding process %d to ready queue\n", p_table->history[i].pid);
-                    pq_insert(ready_queue, &p_table->history[i]);
+                    waiting_enqueue(waiting, &p_table->history[i]);
                 }
                 else
                 {
@@ -265,47 +251,47 @@ void schedule_processes(int cpu_count, int time_slice)
                 }
             }
         }
-        if (!is_queue_empty(running_queue))
+
+        // checking if the running queue and stopping it after tslice
+        if (!is_qempty(running))
         {
-            for (int i = 0; i < cpu_count; i++)
+            for (int i = 0; i < ncpu; i++)
             {
-                if (!is_queue_empty(running_queue))
-                {   struct Process *proc = running_queue->items1[running_queue->front];
-                    if (!proc->completed)
+                if (!is_qempty(running))
+                {
+                    if (!running->items[running->head]->completed)
                     {
-                        pq_insert(ready_queue,proc);
-                        proc->execution_time += time_slice;
+                        struct Process *proc = running->items[running->head];
+                        waiting_enqueue(waiting, proc);
+                        proc->exe_time += time_slice;
                         start_time(&proc->start);
                         if (kill(proc->pid, SIGSTOP) == -1)
                         {
                             perror("kill");
                             exit(1);
                         }
-                        dequeue(running_queue);
                     }
-                    else
-                    {
-                        dequeue(running_queue);
-                    }
+                    running_dequeue(running);
                 }
             }
         }
-        if (!is_pqueue_empty(ready_queue))
+
+        // adding processes to running queue based on ncpu
+        if (!is_pqempty(waiting))
         {
-            for (int i = 0; i < cpu_count; i++)
+            for (int i = 0; i < ncpu; i++)
             {
-                if (!is_pqueue_empty(ready_queue))
+                if (!is_pqempty(waiting))
                 {
-                    struct Process *proc = pq_extract_min(ready_queue);
-                    printf("gonna start running process %d\n", proc->pid);
-                    proc->wait_time += end_time(&proc->start)-time_slice;
+                    struct Process *proc = extract_min(waiting);
+                    proc->wait_time += end_time(&proc->start);
                     start_time(&proc->start);
                     if (kill(proc->pid, SIGCONT) == -1)
                     {
                         perror("kill");
                         exit(1);
                     }
-                    enqueue(running_queue, proc);
+                    running_enqueue(running, proc);
                 }
             }
         }
@@ -314,76 +300,112 @@ void schedule_processes(int cpu_count, int time_slice)
             perror("sem_post");
             exit(1);
         }
-         
     }
 }
 
-static void signal_handler(int signum)
+// signal handler
+static void sign_handler(int signum)
 {
+
     if (signum == SIGINT)
     {
-        terminate_flag = true;
+        ending = true;
     }
 }
 
+// main function
 int main()
 {
-    //printf("schedulerrrrr\n");
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler;
-    if (sigaction(SIGINT, &sa, NULL) == -1)
+    struct sigaction sig;
+    if (memset(&sig, 0, sizeof(sig)) == 0)
+    {
+        perror("memset");
+        exit(1);
+    }
+    sig.sa_handler = sign_handler;
+    if (sigaction(SIGINT, &sig, NULL) == -1)
     {
         perror("sigaction");
         exit(1);
     }
 
+    // accessing the shm in read-write mode
     shm_fd = shm_open("shm", O_RDWR, 0666);
     if (shm_fd == -1)
     {
         perror("shm_open");
         exit(1);
     }
-
-    p_table = mmap(NULL, sizeof(struct history_struct), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    p_table = mmap(NULL, sizeof(struct hist), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     if (p_table == MAP_FAILED)
     {
         perror("mmap");
         exit(1);
     }
+    int ncpu = p_table->ncpu;
+    int time_slice = p_table->time_slice;
 
-    // Wait for the shell to initialize the shared memory
-    while (p_table->ncpu == 0 || p_table->tslice == 0)
+    waiting = (struct pqueue *)(malloc(sizeof(struct pqueue)));
+    if (waiting == NULL)
     {
-        usleep(100000); // Sleep for 100ms
+        perror("malloc");
+        exit(1);
+    }
+    waiting->size = 0;
+    waiting->capacity = 100;
+    waiting->min_heap = (struct Process **)malloc(waiting->capacity * sizeof(struct Process));
+    if (waiting->min_heap == NULL)
+    {
+        perror("malloc");
+        exit(1);
+    }
+    for (int i = 0; i < waiting->capacity; i++)
+    {
+        waiting->min_heap[i] = (struct Process *)malloc(sizeof(struct Process));
+        if (waiting->min_heap[i] == NULL)
+        {
+            perror("malloc");
+            exit(1);
+        }
     }
 
-    int cpu_count = p_table->ncpu;
-    int time_slice = p_table->tslice;
-
-    ready_queue = malloc(sizeof(struct PriorityQueue));
-    ready_queue->size = 0;
-    ready_queue->capacity = MAX_SUBMIT;
-    ready_queue->items2 = (struct Process **)malloc(ready_queue->capacity * sizeof(struct Process *));
-    for (int i = 0; i < ready_queue->capacity; i++)
+    running = (struct queue *)(malloc(sizeof(struct queue)));
+    if (running == NULL)
     {
-        ready_queue->items2[i] = (struct Process *)malloc(sizeof(struct Process));
+        perror("malloc");
+        exit(1);
+    }
+    running->head = running->tail = running->curr = 0;
+    running->capacity = ncpu + 1;
+    running->items = (struct Process **)malloc(running->capacity * sizeof(struct Process));
+    if (running->items == NULL)
+    {
+        perror("malloc");
+        exit(1);
+    }
+    for (int i = 0; i < running->capacity; i++)
+    {
+        running->items[i] = (struct Process *)malloc(sizeof(struct Process));
+        if (running->items[i] == NULL)
+        {
+            perror("malloc");
+            exit(1);
+        }
     }
 
-    running_queue = malloc(sizeof(struct Queue));
-    running_queue->front = running_queue->rear = running_queue->size = 0;
-    running_queue->capacity = cpu_count;
-    running_queue->items1 = (struct Process **)malloc(running_queue->capacity * sizeof(struct Process));
-    for (int i = 0; i < running_queue->capacity; i++)
+    // initialising a semaphore
+    if (sem_init(&p_table->mutex, 1, 1) == -1)
     {
-        running_queue->items1[i] = (struct Process *)malloc(sizeof(struct Process));
+        perror("sem_init");
+        exit(1);
     }
-
-    //creating daemon process
-    // 
-
-    schedule_processes(cpu_count, time_slice);
-
-    cleanup_and_exit();
+    // daemon process
+    if (daemon(1, 1))
+    {
+        perror("daemon");
+        exit(1);
+    }
+    scheduler(ncpu, time_slice);
+    terminate();
     return 0;
 }
