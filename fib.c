@@ -18,9 +18,8 @@ int fibonacci(int n) {
 }
 
 int main() {
-    int n=4;
-    int result = fibonacci(4);
+    int n=30;
+    int result = fibonacci(30);
     printf("The %dth Fibonacci number is: %d\n", n, result);
-
     return 0;
 }
