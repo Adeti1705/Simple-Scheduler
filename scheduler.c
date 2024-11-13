@@ -184,6 +184,8 @@ unsigned long end_time(struct timeval *start)
 
     gettimeofday(&end, 0);
     t = ((end.tv_sec / 1000) + end.tv_usec*1000) - ((start->tv_sec / 1000) + start->tv_usec*1000);
+   //t = (end.tv_sec - start->tv_sec) * 1000 + (end.tv_usec - start->tv_usec) / 1000;
+
     return t;
 }
 
@@ -265,6 +267,9 @@ void scheduler(int ncpu, int time_slice)
                         waiting_enqueue(waiting, proc);
                         proc->exe_time += time_slice;
                         start_time(&proc->start);
+
+                        
+
                         if (kill(proc->pid, SIGSTOP) == -1)
                         {
                             perror("kill");
