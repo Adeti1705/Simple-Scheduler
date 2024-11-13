@@ -53,6 +53,9 @@ void print_history()
         perror("sem_wait");
         exit(1);
     }
+    float avg_wait=0;
+    float avg_completion=0;
+    int c=0;
     if (p_table->history_count > 0)
     {
         printf("\nCommand History:\n");
@@ -60,10 +63,19 @@ void print_history()
         {
             printf("Command %d: %s\n", i + 1, p_table->history[i].command);
             printf("PID: %d\n", p_table->history[i].pid);
-            printf("Execution Time: %ld\n", p_table->history[i].exe_time);
-            printf("Waiting time: %ld \n", p_table->history[i].wait_time);
+            printf("Execution Time: %ld ms\n", p_table->history[i].exe_time);
+            printf("Waiting Time: %ld ms\n", p_table->history[i].wait_time/100);
             printf("\n");
+            if(p_table->history[i].submit){
+                avg_wait+=(p_table->history[i].wait_time/100);
+                avg_completion+=p_table->history[i].exe_time;
+                c++;
+            }
+            
         }
+        printf("\nStatistics\n");
+        printf("Average completion time: %f ms\n", avg_completion / (float)c);
+        printf("Average waiting time: %f ms\n", avg_wait / (float)c);
     }
     if (sem_post(&p_table->mutex) == -1)
     {
